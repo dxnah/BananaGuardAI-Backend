@@ -1,4 +1,11 @@
-cloning and installing:
+### Cloning and Installing
 
-clone (1) git clone https://github.com/dxnah/BananaGuardAI-Backend
-installing dependencies (2) pip install -r requirements.txt
+1. **Clone the repository**
+```bash
+   git clone https://github.com/dxnah/BananaGuardAI-Backend
+```
+
+2. **Install dependencies**
+```bash
+   pip install -r requirements.txt
+```
