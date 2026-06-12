@@ -3,6 +3,18 @@ from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from database import Base
 
+# ── Admins ─────────────────────────────────────────────────────────────────────
+
+class Admin(Base):
+    __tablename__ = "admins"
+ 
+    admin_id        = Column(Integer, primary_key=True, index=True)
+    username        = Column(String(100), unique=True, nullable=False)
+    full_name       = Column(String(200), nullable=True)          # ← NEW
+    hashed_password = Column(String(200), nullable=False)
+    created_at      = Column(DateTime, default=func.now(), nullable=True)
+    last_login      = Column(DateTime, nullable=True)             # ← NEW
+ 
 
 # ── Users ──────────────────────────────────────────────────────────────────────
 class User(Base):
