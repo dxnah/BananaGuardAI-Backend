@@ -7,24 +7,28 @@ from database import Base
 
 class Admin(Base):
     __tablename__ = "admins"
- 
+
     admin_id        = Column(Integer, primary_key=True, index=True)
     username        = Column(String(100), unique=True, nullable=False)
-    full_name       = Column(String(200), nullable=True)          # ← NEW
+    full_name       = Column(String(200), nullable=True)
     hashed_password = Column(String(200), nullable=False)
     created_at      = Column(DateTime, default=func.now(), nullable=True)
-    last_login      = Column(DateTime, nullable=True)             # ← NEW
- 
+    last_login      = Column(DateTime, nullable=True)
 
-# ── Users ──────────────────────────────────────────────────────────────────────
+
+# ── Users (Farmers) ────────────────────────────────────────────────────────────
 class User(Base):
     __tablename__ = "users"
 
-    user_id    = Column(Integer, primary_key=True, index=True)
-    username   = Column(String(100), unique=True, nullable=False)
-    farm_name  = Column(String(200), nullable=True)
-    location   = Column(String(300), nullable=True)
-    created_at = Column(DateTime, default=func.now(), nullable=True)
+    user_id         = Column(Integer, primary_key=True, index=True)
+    full_name       = Column(String(200), nullable=False)
+    username        = Column(String(100), unique=True, nullable=False)
+    hashed_password = Column(String(200), nullable=False)
+    email           = Column(String(200), unique=True, nullable=True)   # optional if phone given
+    phone_number    = Column(String(30),  unique=True, nullable=True)   # optional if email given
+    farm_name       = Column(String(200), nullable=True)
+    location        = Column(String(300), nullable=True)
+    created_at      = Column(DateTime, default=func.now(), nullable=True)
 
     # relationships
     alerts = relationship("Alert", back_populates="user")
@@ -41,7 +45,6 @@ class ScanLog(Base):
     timestamp        = Column(DateTime, default=func.now(), nullable=True)
     device_id        = Column(String(200), nullable=True)
 
-    # relationships
     detections = relationship("DiseaseDetection", back_populates="scan")
 
 
@@ -58,7 +61,6 @@ class DiseaseDetection(Base):
     lesion_count     = Column(Integer, nullable=True)
     recommendation   = Column(Text, nullable=True)
 
-    # relationships
     scan   = relationship("ScanLog", back_populates="detections")
     alerts = relationship("Alert", back_populates="detection")
 
@@ -74,7 +76,6 @@ class Alert(Base):
     alert_sent_at = Column(DateTime, default=func.now(), nullable=True)
     acknowledged  = Column(Boolean, default=False)
 
-    # relationships
     detection = relationship("DiseaseDetection", back_populates="alerts")
     user      = relationship("User", back_populates="alerts")
 
