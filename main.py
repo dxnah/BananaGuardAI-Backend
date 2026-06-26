@@ -1,13 +1,21 @@
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 from dotenv import load_dotenv
 from sqlalchemy.orm import Session
 from typing import Optional
-from auth import verify_user_refresh_token, get_current_user,verify_password, hash_password, create_access_token, create_refresh_token, verify_refresh_token, get_current_admin
+from auth import (
+    verify_user_refresh_token, get_current_user,
+    verify_password, hash_password,
+    create_access_token, create_refresh_token,
+    verify_refresh_token, get_current_admin,
+)
 from pydantic import BaseModel
 from datetime import datetime as dt
- 
+
 import os
 
 from database import Base, engine, get_db
@@ -19,10 +27,15 @@ load_dotenv()
 # ── Auto-create all tables on startup ─────────────────────────────────────────
 Base.metadata.create_all(bind=engine)
 
+# ── Rate limiter ───────────────────────────────────────────────────────────────
+limiter = Limiter(key_func=get_remote_address)
+
 # ── App ────────────────────────────────────────────────────────────────────────
 app = FastAPI(title="BananaGuardAI API", version="1.0.0")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# ── CORS — allow the React dev server ─────────────────────────────────────────
+# ── CORS — localhost only while still in development ───────────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173"],
@@ -33,39 +46,55 @@ app.add_middleware(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# AUTH
+# AUTH  (admin)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class RefreshRequest(BaseModel):
     refresh_token: str
 
+
 @app.post("/auth/login")
+@limiter.limit("5/minute")
 def login(
+    request: Request,
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db),
 ):
     admin = db.query(models.Admin).filter(
         models.Admin.username == form_data.username
     ).first()
- 
+
     if not admin or not verify_password(form_data.password, admin.hashed_password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password",
         )
- 
-    # Record last login time
+
     admin.last_login = dt.utcnow()
     db.commit()
- 
+
     return {
         "access_token":  create_access_token(data={"sub": admin.username}),
         "refresh_token": create_refresh_token(data={"sub": admin.username}),
         "token_type":    "bearer",
     }
- 
- 
-# ── Update profile (full_name, username) ───────────────────────────────────────
+
+
+@app.post("/auth/refresh")
+def refresh_token(body: RefreshRequest, db: Session = Depends(get_db)):
+    """Exchange a valid admin refresh token for a new access token."""
+    admin = verify_refresh_token(body.refresh_token, db)
+    return {
+        "access_token": create_access_token(data={"sub": admin.username}),
+        "token_type":   "bearer",
+    }
+
+
+@app.get("/auth/me", response_model=schemas.AdminOut)
+def get_me(current_admin=Depends(get_current_admin)):
+    return current_admin
+
+
 @app.put("/auth/profile", response_model=schemas.AdminOut)
 def update_profile(
     payload: schemas.AdminUpdateProfile,
@@ -75,7 +104,7 @@ def update_profile(
     admin = db.query(models.Admin).filter(
         models.Admin.admin_id == current_admin.admin_id
     ).first()
- 
+
     if payload.username and payload.username != admin.username:
         existing = db.query(models.Admin).filter(
             models.Admin.username == payload.username
@@ -83,16 +112,15 @@ def update_profile(
         if existing:
             raise HTTPException(status_code=400, detail="Username already taken")
         admin.username = payload.username
- 
+
     if payload.full_name is not None:
         admin.full_name = payload.full_name
- 
+
     db.commit()
     db.refresh(admin)
     return admin
- 
- 
-# ── Change password ────────────────────────────────────────────────────────────
+
+
 @app.put("/auth/change-password")
 def change_password(
     payload: schemas.AdminChangePassword,
@@ -102,44 +130,28 @@ def change_password(
     admin = db.query(models.Admin).filter(
         models.Admin.admin_id == current_admin.admin_id
     ).first()
- 
+
     if not verify_password(payload.current_password, admin.hashed_password):
         raise HTTPException(status_code=400, detail="Current password is incorrect")
- 
+
     if payload.new_password != payload.confirm_password:
         raise HTTPException(status_code=400, detail="New passwords do not match")
- 
+
     if len(payload.new_password) < 8:
         raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
- 
+
     admin.hashed_password = hash_password(payload.new_password)
     db.commit()
     return {"message": "Password updated successfully"}
- 
- 
-@app.post("/auth/refresh")
-def refresh_token(body: RefreshRequest, db: Session = Depends(get_db)):
-    """
-    Call this when the access token expires.
-    Send the refresh token, get a new access token back.
-    """
-    admin = verify_refresh_token(body.refresh_token, db)
-    return {
-        "access_token": create_access_token(data={"sub": admin.username}),
-        "token_type":   "bearer",
-    }
- 
- 
-@app.get("/auth/me", response_model=schemas.AdminOut)
-def get_me(current_admin=Depends(get_current_admin)):
-    return current_admin
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-# USERS (Farmers)
+# USERS  (farmers)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/users/login", response_model=schemas.UserLoginResponse)
-def user_login(payload: schemas.UserLoginRequest, db: Session = Depends(get_db)):
+@limiter.limit("5/minute")
+def user_login(request: Request, payload: schemas.UserLoginRequest, db: Session = Depends(get_db)):
     user = db.query(models.User).filter(
         models.User.username == payload.username
     ).first()
@@ -154,8 +166,8 @@ def user_login(payload: schemas.UserLoginRequest, db: Session = Depends(get_db))
         "token_type":    "bearer",
         "user":          user,
     }
- 
- 
+
+
 @app.post("/users/refresh", response_model=schemas.UserRefreshResponse)
 def user_refresh_token(body: schemas.UserRefreshRequest, db: Session = Depends(get_db)):
     """Exchange a valid user refresh token for a new access token."""
@@ -164,29 +176,43 @@ def user_refresh_token(body: schemas.UserRefreshRequest, db: Session = Depends(g
         "access_token": create_access_token(data={"sub": user.username, "role": "user"}),
         "token_type":   "bearer",
     }
- 
- 
+
+
 @app.get("/users/me", response_model=schemas.UserOut)
 def get_current_user_me(current_user=Depends(get_current_user)):
-    """Get the currently logged-in user from their access token."""
+    """Get the currently logged-in farmer from their access token."""
     return current_user
- 
- 
+
+
+# ── Admin-only: manage farmer accounts ────────────────────────────────────────
+
 @app.get("/users", response_model=list[schemas.UserOut])
-def get_users(db: Session = Depends(get_db)):
+def get_users(
+    db: Session = Depends(get_db),
+    _: models.Admin = Depends(get_current_admin),
+):
     return db.query(models.User).all()
- 
- 
+
+
 @app.get("/users/{user_id}", response_model=schemas.UserOut)
-def get_user(user_id: int, db: Session = Depends(get_db)):
+def get_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    _: models.Admin = Depends(get_current_admin),
+):
     user = db.query(models.User).filter(models.User.user_id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     return user
- 
- 
+
+
 @app.post("/users", response_model=schemas.UserOut, status_code=201)
-def create_user(payload: schemas.UserCreate, db: Session = Depends(get_db)):
+def create_user(
+    payload: schemas.UserCreate,
+    db: Session = Depends(get_db),
+    _: models.Admin = Depends(get_current_admin),
+):
+    """Only admins can register new farmers."""
     if db.query(models.User).filter(models.User.username == payload.username).first():
         raise HTTPException(status_code=400, detail="Username already taken")
     if payload.email:
@@ -195,7 +221,7 @@ def create_user(payload: schemas.UserCreate, db: Session = Depends(get_db)):
     if payload.phone_number:
         if db.query(models.User).filter(models.User.phone_number == payload.phone_number).first():
             raise HTTPException(status_code=400, detail="Phone number already registered")
- 
+
     user = models.User(
         full_name       = payload.full_name,
         username        = payload.username,
@@ -209,14 +235,19 @@ def create_user(payload: schemas.UserCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(user)
     return user
- 
- 
+
+
 @app.put("/users/{user_id}", response_model=schemas.UserOut)
-def update_user(user_id: int, payload: schemas.UserUpdate, db: Session = Depends(get_db)):
+def update_user(
+    user_id: int,
+    payload: schemas.UserUpdate,
+    db: Session = Depends(get_db),
+    _: models.Admin = Depends(get_current_admin),
+):
     user = db.query(models.User).filter(models.User.user_id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
- 
+
     if payload.username and payload.username != user.username:
         if db.query(models.User).filter(models.User.username == payload.username).first():
             raise HTTPException(status_code=400, detail="Username already taken")
@@ -226,21 +257,44 @@ def update_user(user_id: int, payload: schemas.UserUpdate, db: Session = Depends
     if payload.phone_number and payload.phone_number != user.phone_number:
         if db.query(models.User).filter(models.User.phone_number == payload.phone_number).first():
             raise HTTPException(status_code=400, detail="Phone number already registered")
- 
+
     for field, value in payload.model_dump(exclude_unset=True).items():
         setattr(user, field, value)
- 
+
     db.commit()
     db.refresh(user)
     return user
- 
- 
+
+
+@app.delete("/users/{user_id}", status_code=204)
+def delete_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    _: models.Admin = Depends(get_current_admin),
+):
+    user = db.query(models.User).filter(models.User.user_id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    db.delete(user)
+    db.commit()
+
+
+# ── Farmer can only change their own password ──────────────────────────────────
+
 @app.put("/users/{user_id}/change-password")
 def change_user_password(
     user_id: int,
     payload: schemas.UserChangePassword,
+    current_user=Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    # Farmers can only change their own password
+    if current_user.user_id != user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only change your own password",
+        )
+
     user = db.query(models.User).filter(models.User.user_id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -250,31 +304,30 @@ def change_user_password(
         raise HTTPException(status_code=400, detail="New passwords do not match")
     if len(payload.new_password) < 8:
         raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
- 
+
     user.hashed_password = hash_password(payload.new_password)
     db.commit()
     return {"message": "Password updated successfully"}
- 
- 
-@app.delete("/users/{user_id}", status_code=204)
-def delete_user(user_id: int, db: Session = Depends(get_db)):
-    user = db.query(models.User).filter(models.User.user_id == user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    db.delete(user)
-    db.commit()
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SCAN LOGS
+# SCAN LOGS  (admin only)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/scans", response_model=list[schemas.ScanLogOut])
-def get_scans(db: Session = Depends(get_db)):
+def get_scans(
+    db: Session = Depends(get_db),
+    _: models.Admin = Depends(get_current_admin),
+):
     return db.query(models.ScanLog).order_by(models.ScanLog.timestamp.desc()).all()
 
 
 @app.get("/scans/{scan_id}", response_model=schemas.ScanLogOut)
-def get_scan(scan_id: int, db: Session = Depends(get_db)):
+def get_scan(
+    scan_id: int,
+    db: Session = Depends(get_db),
+    _: models.Admin = Depends(get_current_admin),
+):
     scan = db.query(models.ScanLog).filter(models.ScanLog.scan_id == scan_id).first()
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
@@ -282,7 +335,11 @@ def get_scan(scan_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/scans", response_model=schemas.ScanLogOut, status_code=201)
-def create_scan(payload: schemas.ScanLogCreate, db: Session = Depends(get_db)):
+def create_scan(
+    payload: schemas.ScanLogCreate,
+    db: Session = Depends(get_db),
+    _: models.Admin = Depends(get_current_admin),
+):
     scan = models.ScanLog(**payload.model_dump())
     db.add(scan)
     db.commit()
@@ -291,13 +348,14 @@ def create_scan(payload: schemas.ScanLogCreate, db: Session = Depends(get_db)):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DISEASE DETECTIONS
+# DISEASE DETECTIONS  (admin only)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/detections", response_model=list[schemas.DiseaseDetectionOut])
 def get_detections(
     anomaly_only: Optional[bool] = None,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    _: models.Admin = Depends(get_current_admin),
 ):
     query = db.query(models.DiseaseDetection)
     if anomaly_only is not None:
@@ -306,7 +364,11 @@ def get_detections(
 
 
 @app.get("/detections/{detection_id}", response_model=schemas.DiseaseDetectionOut)
-def get_detection(detection_id: int, db: Session = Depends(get_db)):
+def get_detection(
+    detection_id: int,
+    db: Session = Depends(get_db),
+    _: models.Admin = Depends(get_current_admin),
+):
     det = db.query(models.DiseaseDetection).filter(
         models.DiseaseDetection.detection_id == detection_id
     ).first()
@@ -316,7 +378,11 @@ def get_detection(detection_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/detections", response_model=schemas.DiseaseDetectionOut, status_code=201)
-def create_detection(payload: schemas.DiseaseDetectionCreate, db: Session = Depends(get_db)):
+def create_detection(
+    payload: schemas.DiseaseDetectionCreate,
+    db: Session = Depends(get_db),
+    _: models.Admin = Depends(get_current_admin),
+):
     detection = models.DiseaseDetection(**payload.model_dump())
     db.add(detection)
     db.commit()
@@ -325,13 +391,14 @@ def create_detection(payload: schemas.DiseaseDetectionCreate, db: Session = Depe
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ALERTS (Notifications)
+# ALERTS  (admin only)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/alerts", response_model=list[schemas.AlertOut])
 def get_alerts(
     acknowledged: Optional[bool] = None,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    _: models.Admin = Depends(get_current_admin),
 ):
     query = db.query(models.Alert)
     if acknowledged is not None:
@@ -340,7 +407,11 @@ def get_alerts(
 
 
 @app.get("/alerts/{alert_id}", response_model=schemas.AlertOut)
-def get_alert(alert_id: int, db: Session = Depends(get_db)):
+def get_alert(
+    alert_id: int,
+    db: Session = Depends(get_db),
+    _: models.Admin = Depends(get_current_admin),
+):
     alert = db.query(models.Alert).filter(models.Alert.alert_id == alert_id).first()
     if not alert:
         raise HTTPException(status_code=404, detail="Alert not found")
@@ -348,7 +419,11 @@ def get_alert(alert_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/alerts", response_model=schemas.AlertOut, status_code=201)
-def create_alert(payload: schemas.AlertCreate, db: Session = Depends(get_db)):
+def create_alert(
+    payload: schemas.AlertCreate,
+    db: Session = Depends(get_db),
+    _: models.Admin = Depends(get_current_admin),
+):
     alert = models.Alert(**payload.model_dump())
     db.add(alert)
     db.commit()
@@ -357,7 +432,11 @@ def create_alert(payload: schemas.AlertCreate, db: Session = Depends(get_db)):
 
 
 @app.patch("/alerts/{alert_id}/acknowledge", response_model=schemas.AlertOut)
-def acknowledge_alert(alert_id: int, db: Session = Depends(get_db)):
+def acknowledge_alert(
+    alert_id: int,
+    db: Session = Depends(get_db),
+    _: models.Admin = Depends(get_current_admin),
+):
     alert = db.query(models.Alert).filter(models.Alert.alert_id == alert_id).first()
     if not alert:
         raise HTTPException(status_code=404, detail="Alert not found")
@@ -368,11 +447,14 @@ def acknowledge_alert(alert_id: int, db: Session = Depends(get_db)):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DASHBOARD SUMMARY
+# DASHBOARD SUMMARY  (admin only)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/dashboard/summary")
-def dashboard_summary(db: Session = Depends(get_db)):
+def dashboard_summary(
+    db: Session = Depends(get_db),
+    _: models.Admin = Depends(get_current_admin),
+):
     from sqlalchemy import func as sa_func
     from datetime import date
 
@@ -399,15 +481,15 @@ def dashboard_summary(db: Session = Depends(get_db)):
     )
 
     return {
-        "scans_today": scans_today,
-        "active_detections": active_detections,
-        "farmers_notified": farmers_notified,
-        "total_farmers": total_users,
+        "scans_today":        scans_today,
+        "active_detections":  active_detections,
+        "farmers_notified":   farmers_notified,
+        "total_farmers":      total_users,
         "latest_detection": {
-            "detection_id": latest_detection.detection_id,
-            "detected_class": latest_detection.detected_class,
+            "detection_id":     latest_detection.detection_id,
+            "detected_class":   latest_detection.detected_class,
             "tier2_confidence": latest_detection.tier2_confidence,
-            "recommendation": latest_detection.recommendation,
+            "recommendation":   latest_detection.recommendation,
         } if latest_detection else None,
     }
 
