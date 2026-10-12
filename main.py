@@ -210,9 +210,8 @@ def get_user(
 def create_user(
     payload: schemas.UserCreate,
     db: Session = Depends(get_db),
-    _: models.Admin = Depends(get_current_admin),
 ):
-    """Only admins can register new farmers."""
+    """Public farmer self-registration."""
     if db.query(models.User).filter(models.User.username == payload.username).first():
         raise HTTPException(status_code=400, detail="Username already taken")
     if payload.email:
