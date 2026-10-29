@@ -1,4 +1,4 @@
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 from typing import Optional
 from datetime import datetime
 
@@ -161,3 +161,19 @@ class AlertOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+# ── Settings ───────────────────────────────────────────────────────────────────
+
+class SettingsOut(BaseModel):
+    auto_notify:             bool
+    alert_threshold:         int
+    alert_cooldown_hours:    int
+    farmers_can_acknowledge: bool
+
+
+class SettingsUpdate(BaseModel):
+    auto_notify:             Optional[bool] = None
+    alert_threshold:         Optional[int]  = Field(default=None, ge=50, le=100)
+    alert_cooldown_hours:    Optional[int]  = Field(default=None, ge=0, le=168)
+    farmers_can_acknowledge: Optional[bool] = None

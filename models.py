@@ -90,3 +90,11 @@ class TrainingLog(Base):
     train_loss = Column(Float, nullable=True)
     val_loss   = Column(Float, nullable=True)
     mAP50      = Column(Float, nullable=True)
+
+
+# ── App Settings (simple key/value) ────────────────────────────────────────────
+class AppSetting(Base):
+    __tablename__ = "app_settings"
+
+    key   = Column(String(100), primary_key=True)
+    value = Column(String(500), nullable=False)   # saved as JSON text

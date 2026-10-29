@@ -14,9 +14,10 @@ from auth import (
     verify_refresh_token, get_current_admin,
 )
 from pydantic import BaseModel
-from datetime import datetime as dt
+from datetime import datetime as dt, timedelta
 
 import os
+import json
 
 from database import Base, engine, get_db
 import models
@@ -26,6 +27,67 @@ load_dotenv()
 
 # ── Auto-create all tables on startup ─────────────────────────────────────────
 Base.metadata.create_all(bind=engine)
+
+# ── App settings (saved in the database, with safe defaults) ──────────────────
+DEFAULT_SETTINGS = {
+    "auto_notify":             True,   # notify farmers automatically on disease detection
+    "alert_threshold":         80,     # minimum confidence (%) to trigger an automatic alert
+    "alert_cooldown_hours":    6,      # minimum hours between automatic alerts to the same farmer
+    "farmers_can_acknowledge": True,   # farmers may mark their own notifications as read
+}
+
+
+def get_settings(db: Session) -> dict:
+    settings = dict(DEFAULT_SETTINGS)
+    for row in db.query(models.AppSetting).all():
+        if row.key in settings:
+            try:
+                settings[row.key] = json.loads(row.value)
+            except ValueError:
+                pass
+    return settings
+
+
+def auto_notify_farmers(db: Session, detection: models.DiseaseDetection) -> int:
+    """When a disease detection is saved, create a notification for each farmer.
+    Follows the settings: on/off, minimum confidence, and cooldown per farmer."""
+    cfg = get_settings(db)
+    if not cfg["auto_notify"] or not detection.anomaly_detected:
+        return 0
+
+    confidence = (detection.tier2_confidence or 0) * 100
+    if confidence < cfg["alert_threshold"]:
+        return 0
+
+    cutoff = dt.utcnow() - timedelta(hours=cfg["alert_cooldown_hours"])
+    recently_alerted = {
+        user_id for (user_id,) in db.query(models.Alert.user_id).filter(
+            models.Alert.detection_id.isnot(None),
+            models.Alert.user_id.isnot(None),
+            models.Alert.alert_sent_at >= cutoff,
+        ).all()
+    }
+
+    name = detection.detected_class or "Disease"
+    message = f"\u26a0\ufe0f {name} detected ({confidence:.0f}% confidence) near your farm zone."
+    if detection.recommendation:
+        message += f" {detection.recommendation}"
+    message += " Please inspect your crops immediately."
+
+    count = 0
+    for user in db.query(models.User).all():
+        if user.user_id in recently_alerted:
+            continue
+        db.add(models.Alert(
+            detection_id=detection.detection_id,
+            user_id=user.user_id,
+            alert_message=message,
+        ))
+        count += 1
+    if count:
+        db.commit()
+    return count
+
 
 # ── Rate limiter ───────────────────────────────────────────────────────────────
 limiter = Limiter(key_func=get_remote_address)
@@ -182,6 +244,42 @@ def user_refresh_token(body: schemas.UserRefreshRequest, db: Session = Depends(g
 def get_current_user_me(current_user=Depends(get_current_user)):
     """Get the currently logged-in farmer from their access token."""
     return current_user
+
+
+# ── Farmer: read their own notifications ──────────────────────────────────────
+
+@app.get("/users/me/alerts", response_model=list[schemas.AlertOut])
+def get_my_alerts(
+    acknowledged: Optional[bool] = None,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """Notifications sent to the logged-in farmer, newest first."""
+    query = db.query(models.Alert).filter(models.Alert.user_id == current_user.user_id)
+    if acknowledged is not None:
+        query = query.filter(models.Alert.acknowledged == acknowledged)
+    return query.order_by(models.Alert.alert_sent_at.desc()).all()
+
+
+@app.patch("/users/me/alerts/{alert_id}/acknowledge", response_model=schemas.AlertOut)
+def acknowledge_my_alert(
+    alert_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """Farmer marks one of their own notifications as read."""
+    if not get_settings(db)["farmers_can_acknowledge"]:
+        raise HTTPException(status_code=403, detail="Marking notifications as read is turned off.")
+    alert = db.query(models.Alert).filter(
+        models.Alert.alert_id == alert_id,
+        models.Alert.user_id == current_user.user_id,
+    ).first()
+    if not alert:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    alert.acknowledged = True
+    db.commit()
+    db.refresh(alert)
+    return alert
 
 
 # ── Admin-only: manage farmer accounts ────────────────────────────────────────
@@ -386,6 +484,14 @@ def create_detection(
     db.add(detection)
     db.commit()
     db.refresh(detection)
+
+    # A failed notification must never stop the detection from being saved
+    try:
+        auto_notify_farmers(db, detection)
+    except Exception as exc:
+        db.rollback()
+        print("Auto-notify failed:", exc)
+
     return detection
 
 
@@ -423,6 +529,19 @@ def create_alert(
     db: Session = Depends(get_db),
     _: models.Admin = Depends(get_current_admin),
 ):
+    if not payload.alert_message or not payload.alert_message.strip():
+        raise HTTPException(status_code=400, detail="Message is required")
+
+    if payload.user_id is not None:
+        if not db.query(models.User).filter(models.User.user_id == payload.user_id).first():
+            raise HTTPException(status_code=404, detail="Farmer not found")
+
+    if payload.detection_id is not None:
+        if not db.query(models.DiseaseDetection).filter(
+            models.DiseaseDetection.detection_id == payload.detection_id
+        ).first():
+            raise HTTPException(status_code=404, detail="Detection not found")
+
     alert = models.Alert(**payload.model_dump())
     db.add(alert)
     db.commit()
@@ -443,6 +562,36 @@ def acknowledge_alert(
     db.commit()
     db.refresh(alert)
     return alert
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SETTINGS  (admin only)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/settings", response_model=schemas.SettingsOut)
+def read_settings(
+    db: Session = Depends(get_db),
+    _: models.Admin = Depends(get_current_admin),
+):
+    return get_settings(db)
+
+
+@app.put("/settings", response_model=schemas.SettingsOut)
+def update_settings(
+    payload: schemas.SettingsUpdate,
+    db: Session = Depends(get_db),
+    _: models.Admin = Depends(get_current_admin),
+):
+    for key, value in payload.model_dump(exclude_unset=True).items():
+        if value is None:
+            continue
+        row = db.query(models.AppSetting).filter(models.AppSetting.key == key).first()
+        if row:
+            row.value = json.dumps(value)
+        else:
+            db.add(models.AppSetting(key=key, value=json.dumps(value)))
+    db.commit()
+    return get_settings(db)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
