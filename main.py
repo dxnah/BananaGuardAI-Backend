@@ -282,6 +282,25 @@ def acknowledge_my_alert(
     return alert
 
 
+@app.put("/users/me", response_model=schemas.UserOut)
+def update_my_profile(
+    payload: schemas.UserSelfUpdate,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """Farmer edits their own name and mobile number."""
+    if payload.phone_number and payload.phone_number != current_user.phone_number:
+        if db.query(models.User).filter(models.User.phone_number == payload.phone_number).first():
+            raise HTTPException(status_code=400, detail="Mobile number already registered")
+
+    for field, value in payload.model_dump(exclude_unset=True).items():
+        if value is not None:
+            setattr(current_user, field, value)
+    db.commit()
+    db.refresh(current_user)
+    return current_user
+
+
 # ── Admin-only: manage farmer accounts ────────────────────────────────────────
 
 @app.get("/users", response_model=list[schemas.UserOut])
@@ -305,28 +324,23 @@ def get_user(
 
 
 @app.post("/users", response_model=schemas.UserOut, status_code=201)
+@limiter.limit("10/minute")
 def create_user(
+    request: Request,
     payload: schemas.UserCreate,
     db: Session = Depends(get_db),
 ):
-    """Public farmer self-registration."""
+    """Farmer registration (mobile app sign-up, or an admin adding a farmer)."""
     if db.query(models.User).filter(models.User.username == payload.username).first():
         raise HTTPException(status_code=400, detail="Username already taken")
-    if payload.email:
-        if db.query(models.User).filter(models.User.email == payload.email).first():
-            raise HTTPException(status_code=400, detail="Email already registered")
-    if payload.phone_number:
-        if db.query(models.User).filter(models.User.phone_number == payload.phone_number).first():
-            raise HTTPException(status_code=400, detail="Phone number already registered")
+    if db.query(models.User).filter(models.User.phone_number == payload.phone_number).first():
+        raise HTTPException(status_code=400, detail="Mobile number already registered")
 
     user = models.User(
         full_name       = payload.full_name,
         username        = payload.username,
-        hashed_password = hash_password(payload.password),
-        email           = payload.email,
         phone_number    = payload.phone_number,
-        farm_name       = payload.farm_name,
-        location        = payload.location,
+        hashed_password = hash_password(payload.password),
     )
     db.add(user)
     db.commit()
@@ -348,15 +362,13 @@ def update_user(
     if payload.username and payload.username != user.username:
         if db.query(models.User).filter(models.User.username == payload.username).first():
             raise HTTPException(status_code=400, detail="Username already taken")
-    if payload.email and payload.email != user.email:
-        if db.query(models.User).filter(models.User.email == payload.email).first():
-            raise HTTPException(status_code=400, detail="Email already registered")
     if payload.phone_number and payload.phone_number != user.phone_number:
         if db.query(models.User).filter(models.User.phone_number == payload.phone_number).first():
-            raise HTTPException(status_code=400, detail="Phone number already registered")
+            raise HTTPException(status_code=400, detail="Mobile number already registered")
 
     for field, value in payload.model_dump(exclude_unset=True).items():
-        setattr(user, field, value)
+        if value is not None:
+            setattr(user, field, value)
 
     db.commit()
     db.refresh(user)
@@ -372,6 +384,7 @@ def delete_user(
     user = db.query(models.User).filter(models.User.user_id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    db.query(models.Alert).filter(models.Alert.user_id == user_id).delete()
     db.delete(user)
     db.commit()
 

@@ -24,10 +24,7 @@ class User(Base):
     full_name       = Column(String(200), nullable=False)
     username        = Column(String(100), unique=True, nullable=False)
     hashed_password = Column(String(200), nullable=False)
-    email           = Column(String(200), unique=True, nullable=True)   # optional if phone given
-    phone_number    = Column(String(30),  unique=True, nullable=True)   # optional if email given
-    farm_name       = Column(String(200), nullable=True)
-    location        = Column(String(300), nullable=True)
+    phone_number    = Column(String(30),  unique=True, nullable=True) 
     created_at      = Column(DateTime, default=func.now(), nullable=True)
 
     # relationships

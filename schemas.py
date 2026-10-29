@@ -1,6 +1,18 @@
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional
 from datetime import datetime
+import re
+
+# Philippine mobile numbers: 09XXXXXXXXX, +639XXXXXXXXX or 639XXXXXXXXX
+_PH_MOBILE = re.compile(r"^(?:\+?63|0)9\d{9}$")
+
+
+def normalize_ph_mobile(value: str) -> str:
+    """Accepts common ways of typing a PH mobile number and stores it as 09XXXXXXXXX."""
+    cleaned = re.sub(r"[\s\-()]", "", value or "")
+    if not _PH_MOBILE.match(cleaned):
+        raise ValueError("Enter a valid mobile number, e.g. 09171234567")
+    return "0" + cleaned[-10:]
 
 
 # ── Admin ──────────────────────────────────────────────────────────────────────
@@ -30,28 +42,88 @@ class AdminChangePassword(BaseModel):
 # ── Users (Farmers) ────────────────────────────────────────────────────────────
 
 class UserCreate(BaseModel):
+    """Farmer registration: name, username, mobile number and password."""
     full_name:    str
     username:     str
+    phone_number: str
     password:     str
-    email:        Optional[str] = None
-    phone_number: Optional[str] = None
-    farm_name:    Optional[str] = None
-    location:     Optional[str] = None
 
-    @model_validator(mode="after")
-    def email_or_phone_required(self):
-        if not self.email and not self.phone_number:
-            raise ValueError("Either email or phone number is required.")
-        return self
+    @field_validator("full_name", "username")
+    @classmethod
+    def _not_blank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("This field cannot be empty")
+        return v
+
+    @field_validator("username")
+    @classmethod
+    def _username_len(cls, v: str) -> str:
+        if len(v) < 3:
+            raise ValueError("Username must be at least 3 characters")
+        return v
+
+    @field_validator("phone_number")
+    @classmethod
+    def _phone(cls, v: str) -> str:
+        return normalize_ph_mobile(v)
+
+    @field_validator("password")
+    @classmethod
+    def _password_len(cls, v: str) -> str:
+        if len(v) < 8:
+            raise ValueError("Password must be at least 8 characters")
+        return v
 
 
 class UserUpdate(BaseModel):
+    """Admin edits a farmer (password is changed by the farmer, not here)."""
     full_name:    Optional[str] = None
     username:     Optional[str] = None
-    email:        Optional[str] = None
     phone_number: Optional[str] = None
-    farm_name:    Optional[str] = None
-    location:     Optional[str] = None
+
+    @field_validator("full_name", "username")
+    @classmethod
+    def _not_blank(cls, v):
+        if v is None:
+            return v
+        v = v.strip()
+        if not v:
+            raise ValueError("This field cannot be empty")
+        return v
+
+    @field_validator("username")
+    @classmethod
+    def _username_len(cls, v):
+        if v is not None and len(v) < 3:
+            raise ValueError("Username must be at least 3 characters")
+        return v
+
+    @field_validator("phone_number")
+    @classmethod
+    def _phone(cls, v):
+        return None if v is None else normalize_ph_mobile(v)
+
+
+class UserSelfUpdate(BaseModel):
+    """A farmer edits their own profile. Username stays fixed because their login token is tied to it."""
+    full_name:    Optional[str] = None
+    phone_number: Optional[str] = None
+
+    @field_validator("full_name")
+    @classmethod
+    def _name(cls, v):
+        if v is None:
+            return v
+        v = v.strip()
+        if not v:
+            raise ValueError("Full name cannot be empty")
+        return v
+
+    @field_validator("phone_number")
+    @classmethod
+    def _phone(cls, v):
+        return None if v is None else normalize_ph_mobile(v)
 
 
 class UserChangePassword(BaseModel):
@@ -64,10 +136,7 @@ class UserOut(BaseModel):
     user_id:      int
     full_name:    str
     username:     str
-    email:        Optional[str]
     phone_number: Optional[str]
-    farm_name:    Optional[str]
-    location:     Optional[str]
     created_at:   Optional[datetime]
 
     class Config:
