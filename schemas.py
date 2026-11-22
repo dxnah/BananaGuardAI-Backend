@@ -246,3 +246,17 @@ class SettingsUpdate(BaseModel):
     alert_threshold:         Optional[int]  = Field(default=None, ge=50, le=100)
     alert_cooldown_hours:    Optional[int]  = Field(default=None, ge=0, le=168)
     farmers_can_acknowledge: Optional[bool] = None
+
+
+# ── Forgot password ────────────────────────────────────────────────────────────
+
+class ForgotPasswordRequest(BaseModel):
+    username:     str
+    phone_number: str
+
+
+class ResetPasswordRequest(BaseModel):
+    username:         str
+    code:             str
+    new_password:     str
+    confirm_password: str

@@ -1,3 +1,4 @@
+from datetime import datetime
 from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Text
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -95,3 +96,16 @@ class AppSetting(Base):
 
     key   = Column(String(100), primary_key=True)
     value = Column(String(500), nullable=False)   # saved as JSON text
+
+
+# ── Password reset codes (sent to the farmer by SMS) ───────────────────────────
+class PasswordReset(Base):
+    __tablename__ = "password_resets"
+
+    reset_id   = Column(Integer, primary_key=True, index=True)
+    user_id    = Column(Integer, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, index=True)
+    code_hash  = Column(String(64), nullable=False)          # the code itself is never saved
+    expires_at = Column(DateTime, nullable=False)
+    attempts   = Column(Integer, nullable=False, default=0)  # wrong tries so far
+    used       = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)

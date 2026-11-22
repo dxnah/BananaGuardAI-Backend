@@ -18,10 +18,14 @@ from datetime import datetime as dt, timedelta
 
 import os
 import json
+import hmac
+import hashlib
+import secrets
 
 from database import Base, engine, get_db
 import models
 import schemas
+from sms import send_sms, sms_configured
 
 load_dotenv()
 
@@ -238,6 +242,126 @@ def user_refresh_token(body: schemas.UserRefreshRequest, db: Session = Depends(g
         "access_token": create_access_token(data={"sub": user.username, "role": "user"}),
         "token_type":   "bearer",
     }
+
+
+# ── Forgot password (code sent by SMS) ─────────────────────────────────────────
+
+RESET_CODE_MINUTES   = 10   # how long a code works
+RESET_RESEND_SECONDS = 60   # wait before another code can be requested
+RESET_MAX_PER_HOUR   = 5    # codes per farmer per hour
+RESET_MAX_ATTEMPTS   = 5    # wrong tries allowed per code
+
+
+def _hash_reset_code(user_id: int, code: str) -> str:
+    key = (os.getenv("SECRET_KEY") or "").encode()
+    return hmac.new(key, f"{user_id}:{code}".encode(), hashlib.sha256).hexdigest()
+
+
+@app.post("/users/forgot-password")
+@limiter.limit("5/hour")
+def forgot_password(
+    request: Request,
+    payload: schemas.ForgotPasswordRequest,
+    db: Session = Depends(get_db),
+):
+    """Step 1: the farmer enters their username and mobile number and a 6-digit
+    code is texted to that number. The reply is always the same, so nobody can
+    use this to find out who has an account."""
+    generic = {
+        "message": "If the username and mobile number match an account, a 6-digit code was sent by text message."
+    }
+
+    if not sms_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="Text messaging is not set up yet. Please contact the admin.",
+        )
+
+    try:
+        phone = schemas.normalize_ph_mobile(payload.phone_number)
+    except ValueError:
+        return generic
+
+    user = db.query(models.User).filter(models.User.username == payload.username.strip()).first()
+    if not user or user.phone_number != phone:
+        return generic
+
+    now = dt.utcnow()
+    recent = (
+        db.query(models.PasswordReset)
+        .filter(
+            models.PasswordReset.user_id == user.user_id,
+            models.PasswordReset.created_at >= now - timedelta(hours=1),
+        )
+        .order_by(models.PasswordReset.created_at.desc(), models.PasswordReset.reset_id.desc())
+        .all()
+    )
+    if recent and (now - recent[0].created_at).total_seconds() < RESET_RESEND_SECONDS:
+        return generic
+    if len(recent) >= RESET_MAX_PER_HOUR:
+        return generic
+
+    # Only the newest code works
+    db.query(models.PasswordReset).filter(
+        models.PasswordReset.user_id == user.user_id,
+        models.PasswordReset.used.is_(False),
+    ).update({"used": True})
+
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    db.add(models.PasswordReset(
+        user_id=user.user_id,
+        code_hash=_hash_reset_code(user.user_id, code),
+        expires_at=now + timedelta(minutes=RESET_CODE_MINUTES),
+    ))
+    db.commit()
+
+    sent = send_sms(
+        phone,
+        f"BananaGuard AI: your password reset code is {code}. "
+        f"It expires in {RESET_CODE_MINUTES} minutes. Never share this code.",
+    )
+    if not sent:
+        print(f"Reset code could not be sent for user {user.user_id}")
+    return generic
+
+
+@app.post("/users/reset-password")
+@limiter.limit("10/hour")
+def reset_password(
+    request: Request,
+    payload: schemas.ResetPasswordRequest,
+    db: Session = Depends(get_db),
+):
+    """Step 2: the farmer enters the code from the text message and a new password."""
+    if payload.new_password != payload.confirm_password:
+        raise HTTPException(status_code=400, detail="New passwords do not match")
+    if len(payload.new_password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+
+    bad_code = HTTPException(status_code=400, detail="That code is wrong or has expired. Please request a new one.")
+
+    user = db.query(models.User).filter(models.User.username == payload.username.strip()).first()
+    if not user:
+        raise bad_code
+
+    reset = (
+        db.query(models.PasswordReset)
+        .filter(models.PasswordReset.user_id == user.user_id, models.PasswordReset.used.is_(False))
+        .order_by(models.PasswordReset.created_at.desc(), models.PasswordReset.reset_id.desc())
+        .first()
+    )
+    if not reset or reset.expires_at < dt.utcnow() or reset.attempts >= RESET_MAX_ATTEMPTS:
+        raise bad_code
+
+    reset.attempts += 1          # count this try before checking it
+    db.commit()
+    if not hmac.compare_digest(reset.code_hash, _hash_reset_code(user.user_id, payload.code.strip())):
+        raise bad_code
+
+    user.hashed_password = hash_password(payload.new_password)
+    reset.used = True
+    db.commit()
+    return {"message": "Password updated successfully"}
 
 
 @app.get("/users/me", response_model=schemas.UserOut)
