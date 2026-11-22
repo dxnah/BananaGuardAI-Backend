@@ -305,7 +305,7 @@ def forgot_password(
     db.query(models.PasswordReset).filter(
         models.PasswordReset.user_id == user.user_id,
         models.PasswordReset.used.is_(False),
-    ).update({"used": True})
+    ).update({"used": True}, synchronize_session=False)
 
     code = f"{secrets.randbelow(1_000_000):06d}"
     db.add(models.PasswordReset(
