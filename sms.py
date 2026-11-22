@@ -41,7 +41,9 @@ def send_sms(number: str, message: str) -> bool:
 
     try:
         response = requests.post(SEMAPHORE_URL, data=data, timeout=10)
-        response.raise_for_status()
+        if not response.ok:
+            print(f"SMS sending failed: {response.status_code} {response.text}")
+            return False
         return True
     except requests.RequestException as exc:
         print("SMS sending failed:", exc)
